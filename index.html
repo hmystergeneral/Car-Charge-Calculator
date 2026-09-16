@@ -1,0 +1,452 @@
+import React, { useState, useEffect } from 'react';
+
+const PRESET_CARS = [
+  { name: 'Custom Vehicle (Enter manually)', capacity: 60, maxChargeRate: 100, maxAcRate: 11 },
+  { name: 'Tesla Model Y Long Range', capacity: 75, maxChargeRate: 250, maxAcRate: 11 },
+  { name: 'Hyundai IONIQ 5 / Kia EV6', capacity: 77.4, maxChargeRate: 350, maxAcRate: 11 },
+  { name: 'Volkswagen ID.4 Pro', capacity: 77, maxChargeRate: 135, maxAcRate: 11 },
+  { name: 'MG4 EV Long Range', capacity: 64, maxChargeRate: 135, maxAcRate: 11 },
+  { name: 'Porsche Taycan', capacity: 93, maxChargeRate: 320, maxAcRate: 22 },
+  { name: 'Tesla Model 3 RWD Standard', capacity: 60, maxChargeRate: 170, maxAcRate: 11 }
+];
+
+const PRESET_CHARGERS = [
+  { name: 'Home/Public AC (7.4 kW)', speed: 7.4, defaultCost: 0.25 },
+  { name: 'Fast AC (11 kW)', speed: 11, defaultCost: 0.45 },
+  { name: 'Fast AC (22 kW)', speed: 22, defaultCost: 0.45 },
+  { name: 'Standard Rapid (50 kW)', speed: 50, defaultCost: 0.65 },
+  { name: 'Ultra-Rapid (150 kW)', speed: 150, defaultCost: 0.79 },
+  { name: 'Hyper-Rapid (350 kW)', speed: 350, defaultCost: 0.85 },
+  { name: 'Custom Charger', speed: 100, defaultCost: 0.79 },
+];
+
+// Average DC charging efficiency (losses due to aggressive battery cooling and internal resistance)
+// Typically, you lose 10-15% of the billed energy to heat. We use 88% efficiency.
+const CHARGING_EFFICIENCY = 0.88;
+
+const DCChargingDashboard = () => {
+  // Vehicle State
+  const [selectedCarIndex, setSelectedCarIndex] = useState(6); // Default to Model 3 RWD
+  const [batterySize, setBatterySize] = useState(PRESET_CARS[6].capacity);
+  const [maxVehicleChargeRate, setMaxVehicleChargeRate] = useState(PRESET_CARS[6].maxChargeRate);
+  const [maxVehicleAcRate, setMaxVehicleAcRate] = useState(PRESET_CARS[6].maxAcRate);
+  
+  // Charge State
+  const [currentCharge, setCurrentCharge] = useState(10);
+  const [targetCharge, setTargetCharge] = useState(80);
+  
+  // Charger State
+  const [selectedChargerIndex, setSelectedChargerIndex] = useState(4); // Default 150kW
+  const [chargerSpeed, setChargerSpeed] = useState(PRESET_CHARGERS[4].speed);
+  const [costPerKwh, setCostPerKwh] = useState(PRESET_CHARGERS[4].defaultCost); 
+  
+  // Results State
+  const [results, setResults] = useState({
+    totalKwhAdded: 0,
+    totalKwhBilled: 0,
+    totalCost: 0,
+    timeHours: 0,
+    timeMinutes: 0,
+    wastedKwh: 0,
+    isLimitedByCar: false,
+    avgSpeed: 0
+  });
+
+  const handleCarChange = (e) => {
+    const index = parseInt(e.target.value);
+    setSelectedCarIndex(index);
+    if (index !== 0) {
+      setBatterySize(PRESET_CARS[index].capacity);
+      setMaxVehicleChargeRate(PRESET_CARS[index].maxChargeRate);
+      setMaxVehicleAcRate(PRESET_CARS[index].maxAcRate);
+    }
+  };
+
+  const handleChargerChange = (e) => {
+    const index = parseInt(e.target.value);
+    setSelectedChargerIndex(index);
+    if (index !== PRESET_CHARGERS.length - 1) { // If not custom
+      setChargerSpeed(PRESET_CHARGERS[index].speed);
+      setCostPerKwh(PRESET_CHARGERS[index].defaultCost);
+    }
+  };
+
+  useEffect(() => {
+    calculateResults();
+  }, [batterySize, currentCharge, targetCharge, chargerSpeed, costPerKwh, maxVehicleChargeRate, maxVehicleAcRate]);
+
+  const calculateResults = () => {
+    // Validation
+    if (currentCharge >= targetCharge || batterySize <= 0 || chargerSpeed <= 0) {
+      setResults({ totalKwhAdded: 0, totalKwhBilled: 0, totalCost: 0, timeHours: 0, timeMinutes: 0, wastedKwh: 0, isLimitedByCar: false, avgSpeed: 0 });
+      return;
+    }
+
+    const startPercent = Number(currentCharge);
+    const endPercent = Number(targetCharge);
+    let totalTimeHours = 0;
+    
+    const isAC = chargerSpeed <= 43; // Determine if charging is AC (flatter curve)
+    const activeCarLimit = isAC ? maxVehicleAcRate : maxVehicleChargeRate;
+
+    // The theoretical max is the lower of the charger's capability or the car's limit
+    const peakSpeed = Math.min(chargerSpeed, activeCarLimit);
+    const isLimitedByCar = activeCarLimit < chargerSpeed;
+    
+    // Simulate realistic charging curve chunk-by-chunk (1% increments)
+    for (let p = startPercent; p < endPercent; p++) {
+      let currentSpeed = peakSpeed;
+      
+      if (isAC) {
+         // AC Charging is mostly flat, tapering only at the very top for cell balancing
+         if (p >= 95) {
+             currentSpeed = Math.max(peakSpeed * 0.5, 2); 
+         }
+      } else {
+         // Real-world DC Fast Charging Curve Logic
+         if (p < 10) {
+             // Ramp up phase (cold battery or just starting)
+             currentSpeed = peakSpeed * 0.85; 
+         } else if (p >= 10 && p < 50) {
+             // Peak charging window (holds max speed)
+             currentSpeed = peakSpeed;
+         } else if (p >= 50 && p < 80) {
+             // Gradual taper from 50% to 80% (drops linearly from 100% down to ~55% of peak)
+             const dropFactor = 1 - ((p - 50) / 30) * 0.45;
+             currentSpeed = peakSpeed * dropFactor;
+         } else if (p >= 80 && p < 90) {
+             // Aggressive throttle above 80% to protect cells
+             const dropFactor = 0.55 - ((p - 80) / 10) * 0.35; // Drops from 55% to 20%
+             currentSpeed = peakSpeed * dropFactor;
+         } else if (p >= 90) {
+             // Crawl phase to 100%
+             const dropFactor = 0.20 - ((p - 90) / 10) * 0.15; // Drops from 20% to 5%
+             currentSpeed = Math.max(peakSpeed * dropFactor, 3); // Never drops below 3kW
+         }
+      }
+      
+      // Energy needed for this 1% slice
+      const energyForOnePercent = batterySize * 0.01;
+      
+      // Time taken for this 1% slice = Energy (kWh) / Power (kW)
+      const timeForChunk = energyForOnePercent / currentSpeed;
+      totalTimeHours += timeForChunk;
+    }
+
+    const percentageAdded = endPercent - startPercent;
+    const netKwhAdded = (percentageAdded / 100) * batterySize;
+    
+    // Calculate total energy billed by the provider (includes thermal management losses)
+    const grossKwhBilled = netKwhAdded / CHARGING_EFFICIENCY;
+    const wastedKwh = grossKwhBilled - netKwhAdded;
+    
+    const cost = grossKwhBilled * costPerKwh;
+
+    const hours = Math.floor(totalTimeHours);
+    const minutes = Math.round((totalTimeHours - hours) * 60);
+    const avgSpeed = netKwhAdded / totalTimeHours;
+
+    setResults({
+      totalKwhAdded: netKwhAdded,
+      totalKwhBilled: grossKwhBilled,
+      totalCost: cost,
+      timeHours: hours,
+      timeMinutes: minutes,
+      wastedKwh: wastedKwh,
+      isLimitedByCar: isLimitedByCar,
+      avgSpeed: avgSpeed
+    });
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-900 p-4 md:p-8 font-sans text-slate-200">
+      <div className="max-w-5xl mx-auto bg-slate-800 rounded-3xl shadow-2xl border border-slate-700 overflow-hidden">
+        
+        {/* Header */}
+        <div className="bg-gradient-to-r from-blue-600 to-indigo-700 p-8 border-b border-slate-700 relative overflow-hidden">
+          <div className="absolute top-0 right-0 opacity-10 pointer-events-none">
+            <svg width="400" height="400" viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg">
+              <path d="M13 2L3 14H12L11 22L21 10H12L13 2Z" />
+            </svg>
+          </div>
+          <h1 className="text-3xl md:text-4xl font-extrabold text-white flex items-center gap-3 relative z-10">
+            <svg xmlns="http://www.w3.org/2000/svg" className="h-10 w-10 text-yellow-400" viewBox="0 0 20 20" fill="currentColor">
+              <path fillRule="evenodd" d="M11.3 1.046A1 1 0 0112 2v5h4a1 1 0 01.82 1.573l-7 10A1 1 0 018 18v-5H4a1 1 0 01-.82-1.573l7-10a1 1 0 011.12-.381z" clipRule="evenodd" />
+            </svg>
+            EV Charging Analyzer
+          </h1>
+          <p className="mt-3 text-blue-100 text-lg max-w-2xl relative z-10">
+            Precision calculations for AC & DC charging. Accounts for dynamic fast-charging curves, real-world battery throttling above 80%, and thermal management energy loss.
+          </p>
+        </div>
+
+        <div className="p-6 md:p-10 grid grid-cols-1 lg:grid-cols-12 gap-10">
+          
+          {/* Inputs Section (Left/Top) */}
+          <div className="lg:col-span-7 space-y-8">
+            
+            {/* Vehicle Card */}
+            <div className="bg-slate-800/50 p-6 rounded-2xl border border-slate-600 shadow-inner">
+              <h2 className="text-xl font-bold text-white mb-5 flex items-center gap-2">
+                <span className="bg-blue-500/20 text-blue-400 p-2 rounded-lg">
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" /></svg>
+                </span>
+                Vehicle Specifications
+              </h2>
+              
+              <div className="space-y-5">
+                <div>
+                  <label className="block text-sm font-medium text-slate-400 mb-2">Vehicle Preset</label>
+                  <select 
+                    className="w-full p-3 bg-slate-700 border border-slate-600 text-white rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all outline-none"
+                    value={selectedCarIndex}
+                    onChange={handleCarChange}
+                  >
+                    {PRESET_CARS.map((car, index) => (
+                      <option key={index} value={index}>{car.name}</option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
+                  <div>
+                    <label className="block text-sm font-medium text-slate-400 mb-2">Usable Battery (kWh)</label>
+                    <input 
+                      type="number" 
+                      className="w-full p-3 bg-slate-700 border border-slate-600 text-white rounded-xl focus:ring-2 focus:ring-blue-500 transition-all outline-none"
+                      value={batterySize}
+                      onChange={(e) => {
+                        setBatterySize(parseFloat(e.target.value) || 0);
+                        setSelectedCarIndex(0);
+                      }}
+                      min="0" step="0.1"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-slate-400 mb-2">Max AC Input (kW)</label>
+                    <input 
+                      type="number" 
+                      className="w-full p-3 bg-slate-700 border border-slate-600 text-white rounded-xl focus:ring-2 focus:ring-blue-500 transition-all outline-none"
+                      value={maxVehicleAcRate}
+                      onChange={(e) => {
+                        setMaxVehicleAcRate(parseFloat(e.target.value) || 0);
+                        setSelectedCarIndex(0);
+                      }}
+                      min="0"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-slate-400 mb-2">Max DC Input (kW)</label>
+                    <input 
+                      type="number" 
+                      className="w-full p-3 bg-slate-700 border border-slate-600 text-white rounded-xl focus:ring-2 focus:ring-blue-500 transition-all outline-none"
+                      value={maxVehicleChargeRate}
+                      onChange={(e) => {
+                        setMaxVehicleChargeRate(parseFloat(e.target.value) || 0);
+                        setSelectedCarIndex(0);
+                      }}
+                      min="0"
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* SOC Card */}
+            <div className="bg-slate-800/50 p-6 rounded-2xl border border-slate-600 shadow-inner">
+              <h2 className="text-xl font-bold text-white mb-5 flex items-center gap-2">
+                <span className="bg-green-500/20 text-green-400 p-2 rounded-lg">
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+                </span>
+                State of Charge (SOC)
+              </h2>
+              
+              <div className="space-y-8">
+                <div>
+                  <div className="flex justify-between mb-2">
+                    <label className="text-sm font-medium text-slate-400">Current Charge</label>
+                    <span className="text-lg font-bold text-white">{currentCharge}%</span>
+                  </div>
+                  <input 
+                    type="range" min="0" max="99" 
+                    value={currentCharge} 
+                    onChange={(e) => setCurrentCharge(parseInt(e.target.value))}
+                    className="w-full h-2 bg-slate-600 rounded-lg appearance-none cursor-pointer accent-blue-500"
+                  />
+                </div>
+                
+                <div>
+                  <div className="flex justify-between mb-2">
+                    <label className="text-sm font-medium text-slate-400">Target Charge</label>
+                    <span className="text-lg font-bold text-white">{targetCharge}%</span>
+                  </div>
+                  <input 
+                    type="range" min="1" max="100" 
+                    value={targetCharge} 
+                    onChange={(e) => setTargetCharge(parseInt(e.target.value))}
+                    className="w-full h-2 bg-slate-600 rounded-lg appearance-none cursor-pointer accent-indigo-500"
+                  />
+                </div>
+                
+                {/* Warning for charging past 80% */}
+                <div className={`transition-all duration-300 overflow-hidden ${targetCharge > 80 ? 'max-h-24 opacity-100 mt-4' : 'max-h-0 opacity-0 m-0'}`}>
+                   <div className="bg-amber-900/30 border border-amber-700/50 p-3 rounded-lg flex gap-3">
+                     <span className="text-amber-500">⚠️</span>
+                     <p className="text-amber-200/90 text-sm">
+                       <strong>Charging slows severely above 80%</strong> to protect the battery. The last 20% often takes as long as the first 80%.
+                     </p>
+                   </div>
+                </div>
+              </div>
+            </div>
+
+            {/* DC Charger Card */}
+            {/* Charger Network Card */}
+            <div className="bg-slate-800/50 p-6 rounded-2xl border border-slate-600 shadow-inner">
+              <h2 className="text-xl font-bold text-white mb-5 flex items-center gap-2">
+                <span className="bg-purple-500/20 text-purple-400 p-2 rounded-lg">
+                   <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4" /></svg>
+                </span>
+                Charger Network
+              </h2>
+              
+              <div className="space-y-5">
+                 <div>
+                  <label className="block text-sm font-medium text-slate-400 mb-2">Charger Type</label>
+                  <select 
+                    className="w-full p-3 bg-slate-700 border border-slate-600 text-white rounded-xl focus:ring-2 focus:ring-blue-500 transition-all outline-none"
+                    value={selectedChargerIndex}
+                    onChange={handleChargerChange}
+                  >
+                    {PRESET_CHARGERS.map((charger, index) => (
+                      <option key={index} value={index}>{charger.name}</option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="grid grid-cols-2 gap-5">
+                  <div>
+                    <label className="block text-sm font-medium text-slate-400 mb-2">Charger Output (kW)</label>
+                    <input 
+                      type="number" 
+                      className="w-full p-3 bg-slate-700 border border-slate-600 text-white rounded-xl focus:ring-2 focus:ring-blue-500 transition-all outline-none"
+                      value={chargerSpeed === 0 ? '' : chargerSpeed.toString().replace(/^0+(?=\d)/, '')}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        if (val === '') {
+                          setChargerSpeed(0);
+                        } else {
+                          const parsed = parseFloat(val);
+                          setChargerSpeed(isNaN(parsed) ? 0 : parsed);
+                        }
+                        setSelectedChargerIndex(PRESET_CHARGERS.length - 1);
+                      }}
+                      min="0"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-slate-400 mb-2">Network Cost (£/kWh)</label>
+                    <div className="relative">
+                      <span className="absolute inset-y-0 left-0 flex items-center pl-4 text-slate-400 font-bold">£</span>
+                      <input 
+                        type="number" 
+                        className="w-full p-3 pl-8 bg-slate-700 border border-slate-600 text-white rounded-xl focus:ring-2 focus:ring-blue-500 transition-all outline-none"
+                        value={costPerKwh}
+                        onChange={(e) => setCostPerKwh(parseFloat(e.target.value) || 0)}
+                        min="0" step="0.01"
+                      />
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+          </div>
+
+          {/* Results Column (Right/Bottom) */}
+          <div className="lg:col-span-5">
+            <div className="bg-slate-800 rounded-2xl border border-slate-600 h-full flex flex-col shadow-2xl relative overflow-hidden">
+              
+              {/* Top Accent Line */}
+              <div className="h-2 w-full bg-gradient-to-r from-emerald-400 to-cyan-500"></div>
+
+              <div className="p-6 md:p-8 flex-grow flex flex-col justify-between">
+                <div>
+                  <h2 className="text-2xl font-bold text-white mb-6 uppercase tracking-wider text-center">Session Estimate</h2>
+                  
+                  <div className="space-y-6">
+                    
+                    {/* Primary Cost Readout */}
+                    <div className="bg-slate-900/50 p-6 rounded-2xl border border-slate-700 text-center relative">
+                      <p className="text-slate-400 font-medium uppercase tracking-widest text-xs mb-2">Total Billed Cost</p>
+                      <p className="text-6xl font-black text-transparent bg-clip-text bg-gradient-to-br from-emerald-400 to-emerald-600">
+                        £{results.totalCost.toFixed(2)}
+                      </p>
+                      <p className="text-xs text-slate-500 mt-3">Calculated at £{costPerKwh.toFixed(2)}/kWh</p>
+                    </div>
+
+                    {/* Primary Time Readout */}
+                    <div className="bg-slate-900/50 p-6 rounded-2xl border border-slate-700 text-center">
+                      <p className="text-slate-400 font-medium uppercase tracking-widest text-xs mb-2">Charging Duration</p>
+                      <p className="text-4xl font-bold text-white">
+                        {results.timeHours > 0 && <span className="mr-2">{results.timeHours}<span className="text-2xl text-slate-400 font-normal">hr</span></span>}
+                        {results.timeMinutes}<span className="text-2xl text-slate-400 font-normal ml-1">min</span>
+                      </p>
+                      
+                      {results.isLimitedByCar && (
+                        <div className="mt-4 inline-flex items-center gap-2 bg-blue-900/40 border border-blue-800/50 px-3 py-1.5 rounded-full">
+                          <span className="relative flex h-2 w-2">
+                            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75"></span>
+                            <span className="relative inline-flex rounded-full h-2 w-2 bg-blue-500"></span>
+                          </span>
+                          <p className="text-xs text-blue-300 font-medium">
+                            Bottleneck: Vehicle limit ({chargerSpeed <= 43 ? maxVehicleAcRate : maxVehicleChargeRate}kW)
+                          </p>
+                        </div>
+                      )}
+                      {!results.isLimitedByCar && chargerSpeed > 0 && results.totalKwhAdded > 0 && (
+                        <p className="text-xs text-slate-500 mt-4">
+                           Avg session speed: {results.avgSpeed.toFixed(1)} kW
+                        </p>
+                      )}
+                    </div>
+
+                    {/* Energy Metrics */}
+                    <div className="grid grid-cols-2 gap-4">
+                      <div className="bg-slate-900/50 p-4 rounded-xl border border-slate-700">
+                        <p className="text-[10px] text-slate-400 uppercase tracking-wider mb-1">Energy into Battery</p>
+                        <p className="text-xl font-bold text-white">{results.totalKwhAdded.toFixed(1)} <span className="text-sm font-normal text-slate-500">kWh</span></p>
+                      </div>
+                      
+                      <div className="bg-slate-900/50 p-4 rounded-xl border border-slate-700 relative overflow-hidden">
+                        <div className="absolute top-0 right-0 w-2 h-full bg-rose-500/20"></div>
+                        <p className="text-[10px] text-slate-400 uppercase tracking-wider mb-1">Energy Billed (Grid)</p>
+                        <p className="text-xl font-bold text-white">{results.totalKwhBilled.toFixed(1)} <span className="text-sm font-normal text-slate-500">kWh</span></p>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Explanation Box for Wastage */}
+                <div className="mt-8 bg-indigo-950/40 p-4 rounded-xl text-sm text-indigo-200/80 border border-indigo-900/50">
+                  <h4 className="font-semibold text-indigo-300 mb-2 flex items-center gap-2">
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                    Why is billed energy higher?
+                  </h4>
+                  <p className="leading-relaxed">
+                    Charging is not 100% efficient. DC fast charging requires energy for extreme battery cooling, while AC charging loses energy during the AC-to-DC conversion in the car's onboard charger. 
+                    You pay for <strong>{results.wastedKwh.toFixed(1)} kWh</strong> of "lost" energy drawn from the grid.
+                  </p>
+                </div>
+
+              </div>
+            </div>
+          </div>
+          
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default DCChargingDashboard;
